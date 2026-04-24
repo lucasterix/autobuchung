@@ -1250,14 +1250,16 @@ def preview(
         parsed_from_date = _parse_sheet_date(from_date)
 
     skipped = 0
-    ambiguous = 0
     errors = 0
     details: list[dict] = []
 
     # Sammle alle Writes und feuer sie am Ende in exakt 2 API-Calls ab
     # (1× append Review + 1× batchUpdate Source-Status). Ohne diesen Batch
     # rennen wir bei großen Chunks in das Sheets-Write-Quota (60/min).
-    pending_review_rows: list[list[Any]] = []
+    # Getrennt nach "normal" (STATUS_REVIEW, ready for commit) und "ambiguous"
+    # (STATUS_UNSICHER, User muss manuell die richtige Rechnungsnummer wählen).
+    pending_review_rows_normal: list[list[Any]] = []
+    pending_review_rows_ambiguous: list[list[Any]] = []
     pending_source_updates: list[tuple[str, list[list[Any]]]] = []
 
     logger.info(
@@ -1265,8 +1267,10 @@ def preview(
         cfg.tenant, len(rows), max_rows, from_date or "-", dry_run,
     )
 
+    total_pending = 0  # für max_rows-Check (egal ob normal oder ambiguous)
+
     for idx, r in enumerate(rows):
-        if max_rows > 0 and len(pending_review_rows) >= max_rows:
+        if max_rows > 0 and total_pending >= max_rows:
             break
 
         sheet_row = idx + 2
@@ -1296,13 +1300,33 @@ def preview(
             pr = parse_purpose_for_invoice(purpose, cfg)
 
             if pr.skipped_reason == "multiple_candidates_skip":
-                skipped += 1
-                ambiguous += 1
+                # Mehrdeutige Rechnungskandidaten: Zeile trotzdem in Review-Tab
+                # ziehen (als STATUS_UNSICHER), damit der User manuell die
+                # richtige Nummer wählen kann. Kandidaten landen komma-separiert
+                # im Rechnungsnummer-Feld.
+                amount_for_review = _format_cents_eu_as_text(amount_cents)
+                candidates_text = ", ".join(pr.candidates)
+                review_row_amb = [
+                    sheet_row,
+                    STATUS_UNSICHER,
+                    vdate.isoformat(),
+                    amount_for_review,
+                    "",
+                    purpose,
+                    candidates_text,
+                    sheet_row,
+                ]
+                pending_review_rows_ambiguous.append(review_row_amb)
+                pending_source_updates.append(
+                    (f"{cfg.source_tab}!{cfg.source_status_col_letter}{sheet_row}", [[STATUS_REVIEW]])
+                )
+                total_pending += 1
                 details.append({
                     "row": sheet_row,
-                    "skipped": True,
                     "reason": "multiple_invoices",
+                    "action": "moved_to_review_as_unsicher",
                     "candidates": pr.candidates,
+                    "review_status": STATUS_UNSICHER,
                     "tenant": cfg.tenant,
                 })
                 continue
@@ -1324,10 +1348,11 @@ def preview(
                 sheet_row,         # H alter SourceRow-Hinweis
             ]
 
-            pending_review_rows.append(review_row)
+            pending_review_rows_normal.append(review_row)
             pending_source_updates.append(
                 (f"{cfg.source_tab}!{cfg.source_status_col_letter}{sheet_row}", [[STATUS_REVIEW]])
             )
+            total_pending += 1
 
         except Exception as e:
             errors += 1
@@ -1336,9 +1361,11 @@ def preview(
             )
             details.append({"row": sheet_row, "error": str(e), "tenant": cfg.tenant})
 
-    moved = len(pending_review_rows)
+    moved = len(pending_review_rows_normal)
+    ambiguous = len(pending_review_rows_ambiguous)
+    all_pending_review_rows = pending_review_rows_normal + pending_review_rows_ambiguous
 
-    if not dry_run and moved > 0:
+    if not dry_run and all_pending_review_rows:
         # Reihenfolge: zuerst Review-Append, dann Source-Status.
         # Scheitert Append → nichts im Review-Tab, nichts im Source-Status.
         # Scheitert Source-Status → Review-Einträge da, Source-Status leer.
@@ -1348,17 +1375,18 @@ def preview(
         try:
             _append_values(
                 svc, cfg.spreadsheet_id,
-                f"{cfg.review_tab}!A:H", pending_review_rows,
+                f"{cfg.review_tab}!A:H", all_pending_review_rows,
                 tenant=cfg.tenant,
             )
         except Exception as e:
             logger.exception("preview append flush failed tenant=%s: %s", cfg.tenant, e)
-            errors += moved
+            errors += moved + ambiguous
             moved = 0
+            ambiguous = 0
             details.append({
                 "phase": "flush_append",
                 "error": str(e),
-                "pending_rows": len(pending_review_rows),
+                "pending_rows": len(all_pending_review_rows),
                 "tenant": cfg.tenant,
             })
         else:
@@ -1373,8 +1401,9 @@ def preview(
                     "preview source-status flush failed tenant=%s (review already appended): %s",
                     cfg.tenant, e,
                 )
-                errors += moved
+                errors += moved + ambiguous
                 moved = 0
+                ambiguous = 0
                 details.append({
                     "phase": "flush_source_status",
                     "error": str(e),
