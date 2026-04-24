@@ -622,6 +622,17 @@ def _reset_session(cfg: TenantConfig) -> requests.Session:
         return s
 
 
+def _parse_retry_after(value: Optional[str], default: float) -> float:
+    """HTTP Retry-After-Header: entweder Sekunden (int) oder HTTP-Date; wir nehmen nur Sekunden."""
+    if not value:
+        return default
+    try:
+        sec = float(value.strip())
+        return max(0.0, min(sec, 60.0))  # deckeln bei 60s, damit Request nicht ewig hängt
+    except (TypeError, ValueError):
+        return default
+
+
 def _request(cfg: TenantConfig, method: str, url: str, *, params=None, json=None) -> requests.Response:
     last_exc: Optional[Exception] = None
     for attempt in range(3):
@@ -641,6 +652,17 @@ def _request(cfg: TenantConfig, method: str, url: str, *, params=None, json=None
                 method, url, attempt + 1, e,
             )
             time_mod.sleep(0.5 * (2 ** attempt))
+            continue
+
+        if r.status_code == 429:
+            if attempt == 2:
+                return r
+            wait = _parse_retry_after(r.headers.get("Retry-After"), default=2.0 * (2 ** attempt))
+            logger.warning(
+                "patti %s %s rate-limited (429, attempt %d/3), sleeping %.1fs",
+                method, url, attempt + 1, wait,
+            )
+            time_mod.sleep(wait)
             continue
 
         if r.status_code in (401, 403, 419):
@@ -897,20 +919,43 @@ def _find_matching_source_row_transactions(
     review_amount_cents: int,
     review_purpose: str,
     preferred_source_row: Optional[int] = None,
+    source_rows_cache: Optional[list[list[Any]]] = None,
 ) -> tuple[Optional[int], str]:
     if preferred_source_row:
-        ok, _reason = _source_row_matches_review_data(
-            cfg,
-            svc,
-            preferred_source_row,
-            review_vdate=review_vdate,
-            review_amount_cents=review_amount_cents,
-            review_purpose=review_purpose,
-        )
+        # Schneller Preferred-Check bevorzugt aus dem Cache, sonst via Einzel-API-Call.
+        ok = False
+        if source_rows_cache is not None:
+            cache_idx = preferred_source_row - 2
+            if 0 <= cache_idx < len(source_rows_cache):
+                row = source_rows_cache[cache_idx]
+                try:
+                    date_raw = row[cfg.source_date_idx] if len(row) > cfg.source_date_idx else None
+                    amount_raw = row[cfg.source_amount_idx] if len(row) > cfg.source_amount_idx else None
+                    purpose_raw = row[cfg.source_purpose_idx] if len(row) > cfg.source_purpose_idx else ""
+                    if (
+                        _parse_sheet_date(date_raw) == review_vdate
+                        and _parse_amount_to_cents(amount_raw) == review_amount_cents
+                        and _normalize_ws(str(purpose_raw or "")) == _normalize_ws(review_purpose)
+                    ):
+                        ok = True
+                except Exception:
+                    ok = False
+        else:
+            ok, _reason = _source_row_matches_review_data(
+                cfg,
+                svc,
+                preferred_source_row,
+                review_vdate=review_vdate,
+                review_amount_cents=review_amount_cents,
+                review_purpose=review_purpose,
+            )
         if ok:
             return preferred_source_row, "preferred_row_still_matches"
 
-    rows = _get_values(svc, cfg.spreadsheet_id, f"{cfg.source_tab}!{cfg.source_range_a1}")
+    if source_rows_cache is not None:
+        rows = source_rows_cache
+    else:
+        rows = _get_values(svc, cfg.spreadsheet_id, f"{cfg.source_tab}!{cfg.source_range_a1}")
     matches: list[int] = []
 
     want_purpose = _normalize_ws(review_purpose)
@@ -950,6 +995,7 @@ def _sync_source_status_if_possible(
     review_purpose: str,
     source_row_hint: Optional[int],
     target_status: str,
+    source_rows_cache: Optional[list[list[Any]]] = None,
 ) -> dict:
     matched_source_row, sync_reason = _find_matching_source_row_transactions(
         cfg,
@@ -958,6 +1004,7 @@ def _sync_source_status_if_possible(
         review_amount_cents=review_amount_cents,
         review_purpose=review_purpose,
         preferred_source_row=source_row_hint,
+        source_rows_cache=source_rows_cache,
     )
 
     if matched_source_row is None:
@@ -1172,6 +1219,19 @@ def commit(
     errors = 0
     details: list[dict] = []
 
+    # Source-Rows werden lazy einmal pro Commit-Request geladen und dann
+    # für alle Sync-Aufrufe wiederverwendet. Bei 500 Buchungen spart das
+    # 500 Full-Sheet-Reads.
+    source_rows_cache: Optional[list[list[Any]]] = None
+
+    def _get_source_rows_cache() -> list[list[Any]]:
+        nonlocal source_rows_cache
+        if source_rows_cache is None:
+            source_rows_cache = _get_values(
+                svc, cfg.spreadsheet_id, f"{cfg.source_tab}!{cfg.source_range_a1}"
+            )
+        return source_rows_cache
+
     logger.info(
         "commit start tenant=%s rows=%d max_rows=%d dry_run=%s",
         cfg.tenant, len(rows), max_rows, dry_run,
@@ -1256,6 +1316,7 @@ def commit(
                             review_purpose=purpose,
                             source_row_hint=source_row_hint,
                             target_status=STATUS_BEIHILFE_UNBUCHBAR,
+                            source_rows_cache=_get_source_rows_cache(),
                         )
                         details.append({
                             "review_row": review_sheet_row,
@@ -1279,6 +1340,7 @@ def commit(
                             review_purpose=purpose,
                             source_row_hint=source_row_hint,
                             target_status=STATUS_GEBUCHT,
+                            source_rows_cache=_get_source_rows_cache(),
                         )
                         skipped += 1
                         details.append({
@@ -1325,6 +1387,7 @@ def commit(
                 review_purpose=purpose,
                 source_row_hint=source_row_hint,
                 target_status=STATUS_GEBUCHT,
+                source_rows_cache=_get_source_rows_cache(),
             )
 
             booked += 1
