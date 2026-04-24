@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import logging
 import os
 import random
 import re
@@ -32,6 +34,8 @@ except Exception:
     pass
 
 
+logger = logging.getLogger("autobuchung")
+
 router = APIRouter(prefix="/api/bank", tags=["bank"])
 
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -51,6 +55,12 @@ PURPOSE_BLOCKLIST = ("fahrtkostenerstattung", "auslagenerstattung")
 # Tenant A: Jahreszahlen skippen (2000-2050)
 YEAR_MIN = 2000
 YEAR_MAX = 2050
+
+# Google-Service-Account Tokens leben 1h. Wir cachen knapp darunter.
+_SHEETS_SERVICE_TTL = 50 * 60
+
+# Patti-Auth-Probe: definitiv ungültige Rechnungsnummer, nur zum Auth-Check.
+_AUTH_PROBE_INVOICE = "__autobuchung_auth_probe__"
 
 
 # =========================================================
@@ -113,8 +123,10 @@ def _get_tenant_from_request(request: Request) -> str:
     return _env_optional("BANK_DEFAULT_TENANT", "A").strip() or "A"
 
 
-def _load_cfg(request: Request) -> TenantConfig:
-    t = _get_tenant_from_request(request).upper()
+def _load_cfg_for_tenant(tenant: str) -> TenantConfig:
+    t = (tenant or "").strip().upper()
+    if not t:
+        raise HTTPException(status_code=400, detail="Missing tenant")
     prefix = f"{t}_"
 
     invoice_re_a = re.compile(r"(?<!\d)(\d{4}|\d{5})(?!\d)")
@@ -144,6 +156,10 @@ def _load_cfg(request: Request) -> TenantConfig:
     )
 
 
+def _load_cfg(request: Request) -> TenantConfig:
+    return _load_cfg_for_tenant(_get_tenant_from_request(request))
+
+
 # =========================================================
 # API KEY GUARD
 # =========================================================
@@ -151,7 +167,8 @@ def _load_cfg(request: Request) -> TenantConfig:
 def _require_api_key(cfg: TenantConfig, x_api_key: Optional[str]) -> None:
     if not cfg.bank_api_key:
         return
-    if not x_api_key or x_api_key.strip() != cfg.bank_api_key:
+    provided = (x_api_key or "").strip()
+    if not provided or not hmac.compare_digest(provided, cfg.bank_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -166,7 +183,7 @@ def _is_blank_cell(v: Any) -> bool:
 
 
 def _normalize_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").replace("\u00a0", " ")).strip()
+    return re.sub(r"\s+", " ", (s or "").replace(" ", " ")).strip()
 
 
 def _parse_amount_to_cents(value: Any) -> int:
@@ -314,34 +331,70 @@ def parse_purpose_for_invoice(purpose: Optional[str], cfg: TenantConfig) -> Pars
 
 
 # =========================================================
-# GOOGLE SHEETS CLIENT + RETRIES
+# GOOGLE SHEETS CLIENT + RETRIES (cached per tenant)
 # =========================================================
 
+_sheets_cache: dict[str, tuple[float, Any]] = {}
+_sheets_cache_lock = threading.Lock()
+
+
 def _sheets_service(cfg: TenantConfig):
-    creds = service_account.Credentials.from_service_account_file(
-        cfg.google_application_credentials,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    now = time_mod.monotonic()
+    with _sheets_cache_lock:
+        cached = _sheets_cache.get(cfg.tenant)
+        if cached and (now - cached[0]) < _SHEETS_SERVICE_TTL:
+            return cached[1]
+
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            cfg.google_application_credentials,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+    except FileNotFoundError:
+        logger.error(
+            "google creds file missing for tenant %s at %s",
+            cfg.tenant, cfg.google_application_credentials,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google service account file not found: {cfg.google_application_credentials}",
+        )
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+    with _sheets_cache_lock:
+        _sheets_cache[cfg.tenant] = (now, svc)
+    return svc
 
 
-def _is_retryable_google_error(e: Exception) -> bool:
+def _is_retryable_network_error(e: Exception) -> bool:
     if isinstance(e, HttpError):
         status = getattr(e.resp, "status", None)
         return status in (429, 500, 502, 503, 504)
-    return isinstance(e, (TimeoutError, ConnectionError))
+    if isinstance(e, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(
+        e,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    ):
+        return True
+    return False
 
 
-def _retry(fn, *, tries: int = 6, base_sleep: float = 0.6, max_sleep: float = 6.0):
+def _retry(fn, *, tries: int = 6, base_sleep: float = 0.6, max_sleep: float = 6.0, op_label: str = "op"):
     last: Optional[Exception] = None
     for i in range(tries):
         try:
             return fn()
         except Exception as e:
             last = e
-            if not _is_retryable_google_error(e) or i == tries - 1:
+            if not _is_retryable_network_error(e) or i == tries - 1:
                 raise
             sleep = min(max_sleep, base_sleep * (2 ** i)) * (0.75 + random.random() * 0.5)
+            logger.warning("retry %s (attempt %d/%d) after %s: %s", op_label, i + 1, tries, type(e).__name__, e)
             time_mod.sleep(sleep)
     if last:
         raise last
@@ -353,7 +406,7 @@ def _get_values(svc, spreadsheet_id: str, range_a1: str) -> list[list[Any]]:
         sheet = svc.spreadsheets()
         res = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_a1).execute()
         return res.get("values", [])
-    return _retry(_do)
+    return _retry(_do, op_label=f"sheets.get {range_a1}")
 
 
 def _update_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[Any]]):
@@ -365,7 +418,7 @@ def _update_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[An
             valueInputOption="USER_ENTERED",
             body={"values": values},
         ).execute()
-    return _retry(_do)
+    return _retry(_do, op_label=f"sheets.update {range_a1}")
 
 
 def _append_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[Any]]):
@@ -378,10 +431,10 @@ def _append_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[An
             insertDataOption="INSERT_ROWS",
             body={"values": values},
         ).execute()
-    return _retry(_do)
+    return _retry(_do, op_label=f"sheets.append {range_a1}")
 
 
-def _set_review_status_text_no_dropdown_needed(
+def _set_review_status_with_fallback(
     svc,
     cfg: TenantConfig,
     review_sheet_row: int,
@@ -390,10 +443,20 @@ def _set_review_status_text_no_dropdown_needed(
     fallback_status: str = STATUS_UNSICHER,
     fallback_prefix_in_purpose: Optional[str] = None,
 ) -> None:
+    """
+    Status in Spalte B setzen. Wenn Sheet eine Dropdown-Validation hat und
+    status_text dort nicht als Option existiert, fällt die API mit HttpError
+    zurück – dann setzen wir fallback_status und notieren den gewünschten
+    Status als Prefix im Verwendungszweck (Spalte F).
+    """
     try:
         _update_values(svc, cfg.spreadsheet_id, f"{cfg.review_tab}!B{review_sheet_row}", [[status_text]])
         return
-    except HttpError:
+    except HttpError as exc:
+        logger.info(
+            "review status fallback for tenant %s row %d (wanted=%s, using=%s): %s",
+            cfg.tenant, review_sheet_row, status_text, fallback_status, exc,
+        )
         _update_values(svc, cfg.spreadsheet_id, f"{cfg.review_tab}!B{review_sheet_row}", [[fallback_status]])
 
         if fallback_prefix_in_purpose:
@@ -406,16 +469,29 @@ def _set_review_status_text_no_dropdown_needed(
                     cur_val = str(current[0][0] or "")
                 new_val = f"{fallback_prefix_in_purpose}{cur_val}".strip()
                 _update_values(svc, cfg.spreadsheet_id, f"{cfg.review_tab}!F{review_sheet_row}", [[new_val]])
-            except Exception:
-                pass
+            except Exception as sub_exc:
+                logger.warning(
+                    "review purpose-prefix update failed for tenant %s row %d: %s",
+                    cfg.tenant, review_sheet_row, sub_exc,
+                )
 
 
 # =========================================================
-# PATTI SESSION (per-tenant)
+# PATTI SESSION (per-tenant with per-tenant lock)
 # =========================================================
 
-_session_lock = threading.Lock()
 _sessions: dict[str, requests.Session] = {}
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _lock_for(tenant: str) -> threading.Lock:
+    with _session_locks_guard:
+        lk = _session_locks.get(tenant)
+        if lk is None:
+            lk = threading.Lock()
+            _session_locks[tenant] = lk
+        return lk
 
 
 def _make_session() -> requests.Session:
@@ -441,8 +517,36 @@ def _get_xsrf_token(session: requests.Session) -> Optional[str]:
     return unquote(xsrf)
 
 
+def _verify_auth(cfg: TenantConfig, session: requests.Session) -> None:
+    """
+    Bestätigt, dass die Session wirklich authentifiziert ist. Rohes POST /login
+    kann auch bei Falsch-Credentials einen 200/302 liefern und uns glauben lassen,
+    wir seien eingeloggt. Ein Probe-Call auf einen geschützten Endpoint entlarvt
+    das (401/403/419 bei nicht-auth, alles andere gilt als authentifiziert).
+    """
+    try:
+        r = session.get(
+            f"{cfg.patti_base}/api/v1/invoices",
+            params={"number": _AUTH_PROBE_INVOICE},
+            timeout=cfg.http_timeout,
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Patti auth probe network error: {e}")
+
+    if r.status_code in (401, 403, 419):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Patti login did not produce an authenticated session (probe HTTP {r.status_code})",
+        )
+
+
 def _login(cfg: TenantConfig, session: requests.Session) -> None:
-    r = session.get(f"{cfg.patti_base}/login", timeout=cfg.http_timeout)
+    logger.info("patti login starting for tenant %s", cfg.tenant)
+    try:
+        r = session.get(f"{cfg.patti_base}/login", timeout=cfg.http_timeout)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Patti login page network error: {e}")
+
     if r.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Patti login page failed: {r.status_code} {r.text[:200]}")
 
@@ -465,13 +569,17 @@ def _login(cfg: TenantConfig, session: requests.Session) -> None:
     if xsrf:
         headers["X-XSRF-TOKEN"] = xsrf
 
-    r = session.post(
-        f"{cfg.patti_base}/login",
-        data=payload,
-        headers=headers,
-        allow_redirects=False,
-        timeout=cfg.http_timeout,
-    )
+    try:
+        r = session.post(
+            f"{cfg.patti_base}/login",
+            data=payload,
+            headers=headers,
+            allow_redirects=False,
+            timeout=cfg.http_timeout,
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Patti login POST network error: {e}")
+
     if r.status_code not in (200, 302, 303):
         raise HTTPException(status_code=502, detail=f"Patti login failed: {r.status_code} {r.text[:200]}")
 
@@ -479,16 +587,24 @@ def _login(cfg: TenantConfig, session: requests.Session) -> None:
         loc = r.headers["Location"]
         if loc.startswith("/"):
             loc = cfg.patti_base + loc
-        session.get(loc, timeout=cfg.http_timeout)
+        # Redirect folgen, damit Session-Cookies nachgezogen werden. Fehler dabei
+        # sind nicht fatal – _verify_auth entscheidet final.
+        try:
+            session.get(loc, timeout=cfg.http_timeout)
+        except requests.exceptions.RequestException as e:
+            logger.info("patti post-login redirect follow failed for tenant %s: %s", cfg.tenant, e)
 
     session.headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
     xsrf = _get_xsrf_token(session)
     if xsrf:
         session.headers["X-XSRF-TOKEN"] = xsrf
 
+    _verify_auth(cfg, session)
+    logger.info("patti login OK for tenant %s", cfg.tenant)
+
 
 def _get_session(cfg: TenantConfig) -> requests.Session:
-    with _session_lock:
+    with _lock_for(cfg.tenant):
         s = _sessions.get(cfg.tenant)
         if s is None:
             s = _make_session()
@@ -497,29 +613,70 @@ def _get_session(cfg: TenantConfig) -> requests.Session:
         return s
 
 
+def _reset_session(cfg: TenantConfig) -> requests.Session:
+    """Neuen Login erzwingen (Session invalid/expired)."""
+    with _lock_for(cfg.tenant):
+        s = _make_session()
+        _login(cfg, s)
+        _sessions[cfg.tenant] = s
+        return s
+
+
 def _request(cfg: TenantConfig, method: str, url: str, *, params=None, json=None) -> requests.Response:
-    s = _get_session(cfg)
-    r = s.request(method, url, params=params, json=json, timeout=cfg.http_timeout)
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        s = _get_session(cfg)
+        try:
+            r = s.request(method, url, params=params, json=json, timeout=cfg.http_timeout)
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
+            last_exc = e
+            if attempt == 2:
+                raise HTTPException(status_code=502, detail=f"Patti network error: {e}")
+            logger.warning(
+                "patti %s %s network error (attempt %d/3): %s",
+                method, url, attempt + 1, e,
+            )
+            time_mod.sleep(0.5 * (2 ** attempt))
+            continue
 
-    if r.status_code in (401, 403, 419):
-        with _session_lock:
-            s2 = _make_session()
-            _login(cfg, s2)
-            _sessions[cfg.tenant] = s2
-            s = s2
-        r = s.request(method, url, params=params, json=json, timeout=cfg.http_timeout)
+        if r.status_code in (401, 403, 419):
+            if attempt == 2:
+                return r
+            logger.info(
+                "patti %s %s -> %d, re-authenticating tenant %s",
+                method, url, r.status_code, cfg.tenant,
+            )
+            _reset_session(cfg)
+            continue
 
-    return r
+        return r
+
+    # Fallback (sollte nicht erreicht werden)
+    if last_exc:
+        raise HTTPException(status_code=502, detail=f"Patti network error: {last_exc}")
+    raise HTTPException(status_code=502, detail="Patti request exhausted retries")
 
 
 def _lookup_invoice_by_number(cfg: TenantConfig, invoice_no: str) -> dict:
     r = _request(cfg, "GET", f"{cfg.patti_base}/api/v1/invoices", params={"number": invoice_no})
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Invoice lookup failed: {r.status_code} {r.text[:200]}")
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invoice lookup returned non-JSON")
     items = data.get("data") or data.get("invoices") or []
     if not items:
         raise HTTPException(status_code=404, detail=f"Invoice not found: {invoice_no}")
+    if len(items) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Multiple invoices found for number {invoice_no} ({len(items)}). Skipping auto-booking.",
+        )
     return items[0]
 
 
@@ -527,7 +684,10 @@ def _lookup_invoice_detail(cfg: TenantConfig, invoice_id: int) -> dict:
     r = _request(cfg, "GET", f"{cfg.patti_base}/api/v1/invoices/{invoice_id}")
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Invoice detail failed: {r.status_code} {r.text[:200]}")
-    return r.json()
+    try:
+        return r.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invoice detail returned non-JSON")
 
 
 def _pick_invoice_version_id(invoice_detail: dict) -> int:
@@ -549,22 +709,26 @@ def _pick_invoice_version_id(invoice_detail: dict) -> int:
 
 
 def _invoice_has_marker(invoice_detail: dict, marker: str) -> bool:
-    payments = invoice_detail.get("payments") or []
-    if isinstance(payments, list):
+    needle = f"[AUTOBOOK:{marker}]"
+
+    def _scan(payments):
+        if not isinstance(payments, list):
+            return False
         for p in payments:
-            note = str(p.get("note", "") or "")
-            if f"[AUTOBOOK:{marker}]" in note:
+            if not isinstance(p, dict):
+                continue
+            if needle in str(p.get("note", "") or ""):
                 return True
+        return False
+
+    if _scan(invoice_detail.get("payments")):
+        return True
 
     versions = invoice_detail.get("versions") or []
     if isinstance(versions, list):
         for v in versions:
-            vp = v.get("payments") if isinstance(v, dict) else None
-            if isinstance(vp, list):
-                for p in vp:
-                    note = str(p.get("note", "") or "")
-                    if f"[AUTOBOOK:{marker}]" in note:
-                        return True
+            if isinstance(v, dict) and _scan(v.get("payments")):
+                return True
 
     return False
 
@@ -583,7 +747,10 @@ def _create_payment(cfg: TenantConfig, invoice_version_id: int, booked_at_iso: s
     r = _request(cfg, "POST", f"{cfg.patti_base}/api/v1/payments", json=payload)
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Payment failed: {r.status_code} {r.text[:200]}")
-    return r.json()
+    try:
+        return r.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Payment returned non-JSON")
 
 
 def _book_payment_to_patti(cfg: TenantConfig, invoice_no: str, amount_cents: int, value_date: date, purpose: str, marker: str) -> dict:
@@ -660,7 +827,7 @@ def _read_source_row_transactions(cfg: TenantConfig, svc, source_row: int) -> di
     amount_cents = _parse_amount_to_cents(amount_raw)
     purpose = str(purpose_raw or "")
     marker_existing = str(marker_raw).strip() if marker_raw is not None else ""
-    status = str(status_raw).replace("\u00a0", " ").strip() if status_raw is not None else ""
+    status = str(status_raw).replace(" ", " ").strip() if status_raw is not None else ""
 
     return {
         "vdate": vdate,
@@ -681,7 +848,7 @@ def _read_review_row_values(r: list[Any]) -> dict:
     invoice_raw = r[6] if len(r) > 6 else ""
     source_row_h = r[7] if len(r) > 7 else None
 
-    status = str(status_raw).replace("\u00a0", " ").strip() if status_raw is not None else ""
+    status = str(status_raw).replace(" ", " ").strip() if status_raw is not None else ""
     invoice_no = str(invoice_raw).strip() if invoice_raw is not None else ""
     purpose = str(purpose_raw or "")
     name = str(name_raw or "")
@@ -820,18 +987,52 @@ def _sync_source_status_if_possible(
 # ENDPOINTS
 # =========================================================
 
+@router.get("/status")
+def status(tenant: Optional[str] = None, x_api_key: Optional[str] = Header(None)):
+    """
+    Sanity-Check pro Tenant:
+      - alle benötigten ENV-Variablen vorhanden
+      - Service-Account-Datei lesbar
+    Liefert bei Problem 500 mit sprechendem detail. Braucht gültigen API-Key,
+    damit Config-Fehlermeldungen nicht öffentlich exponiert werden.
+    """
+    if not tenant:
+        raise HTTPException(status_code=400, detail="Missing tenant query param")
+    cfg = _load_cfg_for_tenant(tenant)
+    _require_api_key(cfg, x_api_key)
+
+    creds_ok = os.path.isfile(cfg.google_application_credentials)
+    return {
+        "ok": creds_ok,
+        "tenant": cfg.tenant,
+        "patti_base": cfg.patti_base,
+        "spreadsheet_id": cfg.spreadsheet_id,
+        "source_tab": cfg.source_tab,
+        "review_tab": cfg.review_tab,
+        "google_credentials_file": cfg.google_application_credentials,
+        "google_credentials_readable": creds_ok,
+    }
+
+
 @router.post("/import")
 def import_bank_payment(request: Request, req: BankImportRequest, x_api_key: Optional[str] = Header(None)):
     cfg = _load_cfg(request)
     _require_api_key(cfg, x_api_key)
 
-    marker = "legacy"
+    purpose = req.purpose or "Bankimport"
+    marker = _make_fallback_marker(req.value_date, req.amount, purpose)
+
+    logger.info(
+        "import tenant=%s invoice=%s amount=%d date=%s marker=%s",
+        cfg.tenant, req.invoice_no, req.amount, req.value_date.isoformat(), marker,
+    )
+
     result = _book_payment_to_patti(
         cfg=cfg,
         invoice_no=req.invoice_no,
         amount_cents=req.amount,
         value_date=req.value_date,
-        purpose=req.purpose or "Bankimport",
+        purpose=purpose,
         marker=marker,
     )
     return {"ok": True, "tenant": cfg.tenant, "requested_invoice_no": req.invoice_no, "marker": marker, **result}
@@ -861,6 +1062,11 @@ def preview(
     ambiguous = 0
     errors = 0
     details: list[dict] = []
+
+    logger.info(
+        "preview start tenant=%s rows=%d max_rows=%d from_date=%s dry_run=%s",
+        cfg.tenant, len(rows), max_rows, from_date or "-", dry_run,
+    )
 
     for idx, r in enumerate(rows):
         if max_rows > 0 and moved >= max_rows:
@@ -934,7 +1140,15 @@ def preview(
 
         except Exception as e:
             errors += 1
+            logger.exception(
+                "preview row error tenant=%s row=%d: %s", cfg.tenant, sheet_row, e,
+            )
             details.append({"row": sheet_row, "error": str(e), "tenant": cfg.tenant})
+
+    logger.info(
+        "preview done tenant=%s moved=%d skipped=%d ambiguous=%d errors=%d",
+        cfg.tenant, moved, skipped, ambiguous, errors,
+    )
 
     return PreviewResponse(ok=True, moved=moved, skipped=skipped, ambiguous=ambiguous, errors=errors, details=details)
 
@@ -957,6 +1171,11 @@ def commit(
     skipped = 0
     errors = 0
     details: list[dict] = []
+
+    logger.info(
+        "commit start tenant=%s rows=%d max_rows=%d dry_run=%s",
+        cfg.tenant, len(rows), max_rows, dry_run,
+    )
 
     for idx, r in enumerate(rows):
         if max_rows > 0 and booked >= max_rows:
@@ -1020,7 +1239,7 @@ def commit(
 
                     if "multiple versions" in msg:
                         skipped += 1
-                        _set_review_status_text_no_dropdown_needed(
+                        _set_review_status_with_fallback(
                             svc,
                             cfg,
                             review_sheet_row,
@@ -1073,6 +1292,26 @@ def commit(
                         })
                         continue
 
+                    if "multiple invoices found" in msg:
+                        skipped += 1
+                        _set_review_status_with_fallback(
+                            svc,
+                            cfg,
+                            review_sheet_row,
+                            STATUS_UNSICHER,
+                            fallback_status=STATUS_UNSICHER,
+                            fallback_prefix_in_purpose="UNSICHER (mehrere Rechnungen) — ",
+                        )
+                        details.append({
+                            "review_row": review_sheet_row,
+                            "invoice": invoice_no,
+                            "marker": marker,
+                            "skipped": True,
+                            "reason": "multiple_invoices_same_number",
+                            "tenant": cfg.tenant,
+                        })
+                        continue
+
                 raise
 
             _update_values(svc, cfg.spreadsheet_id, f"{cfg.review_tab}!B{review_sheet_row}", [[STATUS_GEBUCHT]])
@@ -1100,10 +1339,18 @@ def commit(
 
         except Exception as e:
             errors += 1
+            logger.exception(
+                "commit row error tenant=%s review_row=%d: %s", cfg.tenant, review_sheet_row, e,
+            )
             details.append({
                 "review_row": review_sheet_row,
                 "error": str(e),
                 "tenant": cfg.tenant,
             })
+
+    logger.info(
+        "commit done tenant=%s booked=%d skipped=%d errors=%d",
+        cfg.tenant, booked, skipped, errors,
+    )
 
     return CommitResponse(ok=True, booked=booked, skipped=skipped, errors=errors, details=details)
