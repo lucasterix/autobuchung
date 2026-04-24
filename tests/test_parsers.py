@@ -3,7 +3,9 @@ from datetime import date
 import pytest
 
 from app.bank_import import (
+    _compute_retry_sleep,
     _format_cents_eu_as_text,
+    _is_httplib2_connection_error,
     _load_cfg_for_tenant,
     _make_fallback_marker,
     _normalize_ws,
@@ -211,3 +213,61 @@ def test_tenant_b_does_not_strip_dates_like_a(cfg_b):
 ])
 def test_parse_retry_after(header, default, expected):
     assert _parse_retry_after(header, default) == expected
+
+
+# ---------------------------------------------------------------------
+# _is_httplib2_connection_error – erkennt httplib2's NoneType.readline-Bug
+# ---------------------------------------------------------------------
+
+def test_httplib2_bug_detected():
+    e = AttributeError("'NoneType' object has no attribute 'readline'")
+    assert _is_httplib2_connection_error(e) is True
+
+
+def test_httplib2_bug_not_matched_by_other_attributeerrors():
+    assert _is_httplib2_connection_error(AttributeError("'foo' has no attribute 'bar'")) is False
+    assert _is_httplib2_connection_error(ValueError("anything")) is False
+
+
+# ---------------------------------------------------------------------
+# _compute_retry_sleep – 429 respektiert Retry-After, sonst exp. backoff
+# ---------------------------------------------------------------------
+
+class _FakeResp(dict):
+    def __init__(self, status, headers=None):
+        super().__init__(headers or {})
+        self.status = status
+        self.reason = "test"
+
+
+def test_compute_sleep_non_http_uses_exp_backoff():
+    e = ConnectionError("boom")
+    wait = _compute_retry_sleep(e, attempt=0, base_sleep=0.6, max_sleep=60.0)
+    # base_sleep * 2^0 = 0.6, mit Jitter 0.75–1.25 → ~0.45 bis ~0.75
+    assert 0.4 <= wait <= 0.8
+
+
+def test_compute_sleep_http_429_uses_retry_after_header():
+    from googleapiclient.errors import HttpError
+    resp = _FakeResp(429, {"retry-after": "30"})
+    e = HttpError(resp, b"quota")
+    wait = _compute_retry_sleep(e, attempt=0, base_sleep=0.6, max_sleep=60.0)
+    assert wait == 30.0
+
+
+def test_compute_sleep_http_429_without_retry_after_uses_safe_default():
+    from googleapiclient.errors import HttpError
+    resp = _FakeResp(429, {})
+    e = HttpError(resp, b"quota")
+    wait = _compute_retry_sleep(e, attempt=0, base_sleep=0.6, max_sleep=60.0)
+    # Default = 20 * 1.5^0 = 20s beim ersten Fail
+    assert wait == 20.0
+
+
+def test_compute_sleep_http_500_uses_exp_backoff():
+    from googleapiclient.errors import HttpError
+    resp = _FakeResp(500, {})
+    e = HttpError(resp, b"boom")
+    wait = _compute_retry_sleep(e, attempt=1, base_sleep=0.6, max_sleep=60.0)
+    # attempt=1: 0.6 * 2 = 1.2 * jitter(0.75..1.25) → 0.9..1.5
+    assert 0.8 <= wait <= 1.6

@@ -366,10 +366,26 @@ def _sheets_service(cfg: TenantConfig):
     return svc
 
 
+def _invalidate_sheets_cache(tenant: str) -> None:
+    with _sheets_cache_lock:
+        _sheets_cache.pop(tenant, None)
+
+
+def _is_httplib2_connection_error(e: Exception) -> bool:
+    """
+    Bekannter httplib2-Bug: cached HTTP-Connection ist tot → 'NoneType' object
+    has no attribute 'readline'. Muss als transient behandelt und der Service
+    neu erzeugt werden.
+    """
+    if isinstance(e, AttributeError) and "readline" in str(e) and "NoneType" in str(e):
+        return True
+    return False
+
+
 def _is_retryable_network_error(e: Exception) -> bool:
     if isinstance(e, HttpError):
         status = getattr(e.resp, "status", None)
-        return status in (429, 500, 502, 503, 504)
+        return status in (408, 429, 500, 502, 503, 504)
     if isinstance(e, (TimeoutError, ConnectionError)):
         return True
     if isinstance(
@@ -381,10 +397,41 @@ def _is_retryable_network_error(e: Exception) -> bool:
         ),
     ):
         return True
+    if _is_httplib2_connection_error(e):
+        return True
     return False
 
 
-def _retry(fn, *, tries: int = 6, base_sleep: float = 0.6, max_sleep: float = 6.0, op_label: str = "op"):
+def _compute_retry_sleep(e: Exception, attempt: int, base_sleep: float, max_sleep: float) -> float:
+    """
+    Sleep zwischen Retries. Für HTTP 429 (Quota) respektieren wir den
+    Retry-After-Header (Google Sheets liefert den zuverlässig) und schlafen
+    mindestens ~20 s beim ersten Fail, damit das 60-s-Quota-Fenster frei läuft.
+    Sonst normaler exponentieller Backoff mit Jitter.
+    """
+    if isinstance(e, HttpError):
+        status = getattr(e.resp, "status", None)
+        if status == 429:
+            retry_after_raw = None
+            try:
+                retry_after_raw = e.resp.get("retry-after") or e.resp.get("Retry-After")
+            except Exception:
+                retry_after_raw = None
+            default_wait = min(max_sleep, 20.0 * (1.5 ** attempt))
+            return _parse_retry_after(retry_after_raw, default=default_wait)
+
+    return min(max_sleep, base_sleep * (2 ** attempt)) * (0.75 + random.random() * 0.5)
+
+
+def _retry(
+    fn,
+    *,
+    tries: int = 6,
+    base_sleep: float = 0.6,
+    max_sleep: float = 60.0,
+    op_label: str = "op",
+    invalidate_tenant: Optional[str] = None,
+):
     last: Optional[Exception] = None
     for i in range(tries):
         try:
@@ -393,23 +440,37 @@ def _retry(fn, *, tries: int = 6, base_sleep: float = 0.6, max_sleep: float = 6.
             last = e
             if not _is_retryable_network_error(e) or i == tries - 1:
                 raise
-            sleep = min(max_sleep, base_sleep * (2 ** i)) * (0.75 + random.random() * 0.5)
-            logger.warning("retry %s (attempt %d/%d) after %s: %s", op_label, i + 1, tries, type(e).__name__, e)
-            time_mod.sleep(sleep)
+
+            # Bei httplib2-Connection-Müll oder connection-basierten Errors:
+            # cached Sheets-Service ist vermutlich tot → invalidieren, damit
+            # der nächste Aufruf einen frischen Service zieht.
+            if invalidate_tenant and (
+                _is_httplib2_connection_error(e)
+                or isinstance(e, (TimeoutError, ConnectionError))
+                or isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+            ):
+                _invalidate_sheets_cache(invalidate_tenant)
+
+            wait = _compute_retry_sleep(e, i, base_sleep, max_sleep)
+            logger.warning(
+                "retry %s (attempt %d/%d) after %s, sleeping %.1fs",
+                op_label, i + 1, tries, type(e).__name__, wait,
+            )
+            time_mod.sleep(wait)
     if last:
         raise last
     raise RuntimeError("retry failed without exception")
 
 
-def _get_values(svc, spreadsheet_id: str, range_a1: str) -> list[list[Any]]:
+def _get_values(svc, spreadsheet_id: str, range_a1: str, *, tenant: Optional[str] = None) -> list[list[Any]]:
     def _do():
         sheet = svc.spreadsheets()
         res = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_a1).execute()
         return res.get("values", [])
-    return _retry(_do, op_label=f"sheets.get {range_a1}")
+    return _retry(_do, op_label=f"sheets.get {range_a1}", invalidate_tenant=tenant)
 
 
-def _update_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[Any]]):
+def _update_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[Any]], *, tenant: Optional[str] = None):
     def _do():
         sheet = svc.spreadsheets()
         return sheet.values().update(
@@ -418,10 +479,10 @@ def _update_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[An
             valueInputOption="USER_ENTERED",
             body={"values": values},
         ).execute()
-    return _retry(_do, op_label=f"sheets.update {range_a1}")
+    return _retry(_do, op_label=f"sheets.update {range_a1}", invalidate_tenant=tenant)
 
 
-def _append_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[Any]]):
+def _append_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[Any]], *, tenant: Optional[str] = None):
     def _do():
         sheet = svc.spreadsheets()
         return sheet.values().append(
@@ -431,7 +492,40 @@ def _append_values(svc, spreadsheet_id: str, range_a1: str, values: list[list[An
             insertDataOption="INSERT_ROWS",
             body={"values": values},
         ).execute()
-    return _retry(_do, op_label=f"sheets.append {range_a1}")
+    return _retry(_do, op_label=f"sheets.append {range_a1}", invalidate_tenant=tenant)
+
+
+def _batch_update_values(
+    svc,
+    spreadsheet_id: str,
+    updates: list[tuple[str, list[list[Any]]]],
+    *,
+    tenant: Optional[str] = None,
+):
+    """
+    Führt mehrere Range-Updates in *einem* API-Call aus.
+    updates: Liste von (range_a1, values) Tupeln.
+
+    Bei 1200 Buchungen spart das ~1200 einzelne Write-Requests (60/min Quota).
+    """
+    if not updates:
+        return None
+    body = {
+        "valueInputOption": "USER_ENTERED",
+        "data": [{"range": r, "values": v} for r, v in updates],
+    }
+
+    def _do():
+        return svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body=body,
+        ).execute()
+
+    return _retry(
+        _do,
+        op_label=f"sheets.batchUpdate ({len(updates)} ranges)",
+        invalidate_tenant=tenant,
+    )
 
 
 def _set_review_status_with_fallback(
@@ -985,6 +1079,57 @@ def _find_matching_source_row_transactions(
     return None, f"multiple_matching_source_rows:{len(matches)}"
 
 
+def _sync_source_status_if_possible_batched(
+    cfg: TenantConfig,
+    *,
+    review_sheet_row: int,
+    review_vdate: date,
+    review_amount_cents: int,
+    review_purpose: str,
+    source_row_hint: Optional[int],
+    target_status: str,
+    source_rows_cache: list[list[Any]],
+    pending_updates: list[tuple[str, list[list[Any]]]],
+) -> dict:
+    """
+    Identische Matching-Logik wie _sync_source_status_if_possible, aber
+    schreibt das Source-Status-Update nicht direkt, sondern queued es in
+    `pending_updates` für einen späteren batchUpdate. Gibt dasselbe
+    sync_info-Dict wie die Original-Funktion zurück.
+    """
+    matched_source_row, sync_reason = _find_matching_source_row_transactions(
+        cfg,
+        None,  # svc wird nur im Non-Cache-Pfad benötigt; Cache ist hier pflicht
+        review_vdate=review_vdate,
+        review_amount_cents=review_amount_cents,
+        review_purpose=review_purpose,
+        preferred_source_row=source_row_hint,
+        source_rows_cache=source_rows_cache,
+    )
+
+    if matched_source_row is None:
+        return {
+            "source_status_synced": False,
+            "source_row": None,
+            "source_sync_reason": sync_reason,
+            "review_row": review_sheet_row,
+        }
+
+    pending_updates.append(
+        (
+            f"{cfg.source_tab}!{cfg.source_status_col_letter}{matched_source_row}",
+            [[target_status]],
+        )
+    )
+
+    return {
+        "source_status_synced": True,
+        "source_row": matched_source_row,
+        "source_sync_reason": sync_reason,
+        "review_row": review_sheet_row,
+    }
+
+
 def _sync_source_status_if_possible(
     cfg: TenantConfig,
     svc,
@@ -1098,17 +1243,22 @@ def preview(
     svc = _sheets_service(cfg)
 
     source_range = f"{cfg.source_tab}!{cfg.source_range_a1}"
-    rows = _get_values(svc, cfg.spreadsheet_id, source_range)
+    rows = _get_values(svc, cfg.spreadsheet_id, source_range, tenant=cfg.tenant)
 
     parsed_from_date: Optional[date] = None
     if from_date:
         parsed_from_date = _parse_sheet_date(from_date)
 
-    moved = 0
     skipped = 0
     ambiguous = 0
     errors = 0
     details: list[dict] = []
+
+    # Sammle alle Writes und feuer sie am Ende in exakt 2 API-Calls ab
+    # (1× append Review + 1× batchUpdate Source-Status). Ohne diesen Batch
+    # rennen wir bei großen Chunks in das Sheets-Write-Quota (60/min).
+    pending_review_rows: list[list[Any]] = []
+    pending_source_updates: list[tuple[str, list[list[Any]]]] = []
 
     logger.info(
         "preview start tenant=%s rows=%d max_rows=%d from_date=%s dry_run=%s",
@@ -1116,7 +1266,7 @@ def preview(
     )
 
     for idx, r in enumerate(rows):
-        if max_rows > 0 and moved >= max_rows:
+        if max_rows > 0 and len(pending_review_rows) >= max_rows:
             break
 
         sheet_row = idx + 2
@@ -1174,16 +1324,10 @@ def preview(
                 sheet_row,         # H alter SourceRow-Hinweis
             ]
 
-            if not dry_run:
-                _append_values(svc, cfg.spreadsheet_id, f"{cfg.review_tab}!A:H", [review_row])
-                _update_values(
-                    svc,
-                    cfg.spreadsheet_id,
-                    f"{cfg.source_tab}!{cfg.source_status_col_letter}{sheet_row}",
-                    [[STATUS_REVIEW]],
-                )
-
-            moved += 1
+            pending_review_rows.append(review_row)
+            pending_source_updates.append(
+                (f"{cfg.source_tab}!{cfg.source_status_col_letter}{sheet_row}", [[STATUS_REVIEW]])
+            )
 
         except Exception as e:
             errors += 1
@@ -1191,6 +1335,53 @@ def preview(
                 "preview row error tenant=%s row=%d: %s", cfg.tenant, sheet_row, e,
             )
             details.append({"row": sheet_row, "error": str(e), "tenant": cfg.tenant})
+
+    moved = len(pending_review_rows)
+
+    if not dry_run and moved > 0:
+        # Reihenfolge: zuerst Review-Append, dann Source-Status.
+        # Scheitert Append → nichts im Review-Tab, nichts im Source-Status.
+        # Scheitert Source-Status → Review-Einträge da, Source-Status leer.
+        # Nächster Batch würde diese Rows nochmal als unbearbeitet sehen
+        # und Duplikate erzeugen. Wir loggen das laut, damit der User manuell
+        # nacharbeiten kann.
+        try:
+            _append_values(
+                svc, cfg.spreadsheet_id,
+                f"{cfg.review_tab}!A:H", pending_review_rows,
+                tenant=cfg.tenant,
+            )
+        except Exception as e:
+            logger.exception("preview append flush failed tenant=%s: %s", cfg.tenant, e)
+            errors += moved
+            moved = 0
+            details.append({
+                "phase": "flush_append",
+                "error": str(e),
+                "pending_rows": len(pending_review_rows),
+                "tenant": cfg.tenant,
+            })
+        else:
+            try:
+                _batch_update_values(
+                    svc, cfg.spreadsheet_id,
+                    pending_source_updates,
+                    tenant=cfg.tenant,
+                )
+            except Exception as e:
+                logger.exception(
+                    "preview source-status flush failed tenant=%s (review already appended): %s",
+                    cfg.tenant, e,
+                )
+                errors += moved
+                moved = 0
+                details.append({
+                    "phase": "flush_source_status",
+                    "error": str(e),
+                    "warning": "review rows appended but source status not updated — may produce duplicates in next run",
+                    "pending_rows": len(pending_source_updates),
+                    "tenant": cfg.tenant,
+                })
 
     logger.info(
         "preview done tenant=%s moved=%d skipped=%d ambiguous=%d errors=%d",
@@ -1212,7 +1403,7 @@ def commit(
     svc = _sheets_service(cfg)
 
     review_range = f"{cfg.review_tab}!{cfg.review_range_a1}"
-    rows = _get_values(svc, cfg.spreadsheet_id, review_range)
+    rows = _get_values(svc, cfg.spreadsheet_id, review_range, tenant=cfg.tenant)
 
     booked = 0
     skipped = 0
@@ -1228,9 +1419,18 @@ def commit(
         nonlocal source_rows_cache
         if source_rows_cache is None:
             source_rows_cache = _get_values(
-                svc, cfg.spreadsheet_id, f"{cfg.source_tab}!{cfg.source_range_a1}"
+                svc, cfg.spreadsheet_id,
+                f"{cfg.source_tab}!{cfg.source_range_a1}",
+                tenant=cfg.tenant,
             )
         return source_rows_cache
+
+    # Writes werden gesammelt und am Ende in 1× batchUpdate abgefeuert
+    # (statt ~2 API-Calls pro gebuchter Zeile). Fallback-Statuswechsel
+    # (BEIHILFE/UNSICHER) müssen pro Zeile bleiben, weil sie ggf. den
+    # Purpose-Text updaten, wenn Sheets-Dropdown den Wert ablehnt.
+    pending_sheet_updates: list[tuple[str, list[list[Any]]]] = []
+    pending_fallback_rows: list[dict] = []  # für BEIHILFE/UNSICHER
 
     logger.info(
         "commit start tenant=%s rows=%d max_rows=%d dry_run=%s",
@@ -1299,25 +1499,16 @@ def commit(
 
                     if "multiple versions" in msg:
                         skipped += 1
-                        _set_review_status_with_fallback(
-                            svc,
-                            cfg,
-                            review_sheet_row,
-                            STATUS_BEIHILFE_UNBUCHBAR,
-                            fallback_status=STATUS_BEIHILFE_UNBUCHBAR,
-                            fallback_prefix_in_purpose="BEIHILFE (unbuchbar) — ",
-                        )
-                        sync_info = _sync_source_status_if_possible(
-                            cfg,
-                            svc,
-                            review_sheet_row=review_sheet_row,
-                            review_vdate=vdate,
-                            review_amount_cents=amount_cents,
-                            review_purpose=purpose,
-                            source_row_hint=source_row_hint,
-                            target_status=STATUS_BEIHILFE_UNBUCHBAR,
-                            source_rows_cache=_get_source_rows_cache(),
-                        )
+                        pending_fallback_rows.append({
+                            "review_row": review_sheet_row,
+                            "status": STATUS_BEIHILFE_UNBUCHBAR,
+                            "prefix": "BEIHILFE (unbuchbar) — ",
+                            "source_row_hint": source_row_hint,
+                            "source_status": STATUS_BEIHILFE_UNBUCHBAR,
+                            "vdate": vdate,
+                            "amount_cents": amount_cents,
+                            "purpose": purpose,
+                        })
                         details.append({
                             "review_row": review_sheet_row,
                             "invoice": invoice_no,
@@ -1325,15 +1516,15 @@ def commit(
                             "skipped": True,
                             "reason": "beihilfe_multiple_versions",
                             "tenant": cfg.tenant,
-                            **sync_info,
                         })
                         continue
 
                     if "duplicate" in msg or "marker" in msg:
-                        _update_values(svc, cfg.spreadsheet_id, f"{cfg.review_tab}!B{review_sheet_row}", [[STATUS_GEBUCHT]])
-                        sync_info = _sync_source_status_if_possible(
+                        pending_sheet_updates.append(
+                            (f"{cfg.review_tab}!B{review_sheet_row}", [[STATUS_GEBUCHT]])
+                        )
+                        sync_info = _sync_source_status_if_possible_batched(
                             cfg,
-                            svc,
                             review_sheet_row=review_sheet_row,
                             review_vdate=vdate,
                             review_amount_cents=amount_cents,
@@ -1341,6 +1532,7 @@ def commit(
                             source_row_hint=source_row_hint,
                             target_status=STATUS_GEBUCHT,
                             source_rows_cache=_get_source_rows_cache(),
+                            pending_updates=pending_sheet_updates,
                         )
                         skipped += 1
                         details.append({
@@ -1356,14 +1548,16 @@ def commit(
 
                     if "multiple invoices found" in msg:
                         skipped += 1
-                        _set_review_status_with_fallback(
-                            svc,
-                            cfg,
-                            review_sheet_row,
-                            STATUS_UNSICHER,
-                            fallback_status=STATUS_UNSICHER,
-                            fallback_prefix_in_purpose="UNSICHER (mehrere Rechnungen) — ",
-                        )
+                        pending_fallback_rows.append({
+                            "review_row": review_sheet_row,
+                            "status": STATUS_UNSICHER,
+                            "prefix": "UNSICHER (mehrere Rechnungen) — ",
+                            "source_row_hint": None,
+                            "source_status": None,
+                            "vdate": vdate,
+                            "amount_cents": amount_cents,
+                            "purpose": purpose,
+                        })
                         details.append({
                             "review_row": review_sheet_row,
                             "invoice": invoice_no,
@@ -1376,11 +1570,12 @@ def commit(
 
                 raise
 
-            _update_values(svc, cfg.spreadsheet_id, f"{cfg.review_tab}!B{review_sheet_row}", [[STATUS_GEBUCHT]])
-
-            sync_info = _sync_source_status_if_possible(
+            # Erfolgsfall: Review-Status + Source-Status → STATUS_GEBUCHT
+            pending_sheet_updates.append(
+                (f"{cfg.review_tab}!B{review_sheet_row}", [[STATUS_GEBUCHT]])
+            )
+            sync_info = _sync_source_status_if_possible_batched(
                 cfg,
-                svc,
                 review_sheet_row=review_sheet_row,
                 review_vdate=vdate,
                 review_amount_cents=amount_cents,
@@ -1388,6 +1583,7 @@ def commit(
                 source_row_hint=source_row_hint,
                 target_status=STATUS_GEBUCHT,
                 source_rows_cache=_get_source_rows_cache(),
+                pending_updates=pending_sheet_updates,
             )
 
             booked += 1
@@ -1407,6 +1603,72 @@ def commit(
             )
             details.append({
                 "review_row": review_sheet_row,
+                "error": str(e),
+                "tenant": cfg.tenant,
+            })
+
+    # Flush: alle GEBUCHT-Updates in 1 API-Call
+    if pending_sheet_updates:
+        try:
+            _batch_update_values(
+                svc, cfg.spreadsheet_id,
+                pending_sheet_updates,
+                tenant=cfg.tenant,
+            )
+        except HttpError as e:
+            # Häufigster Fall: Dropdown-Validation rejected "Gebucht" → per-row
+            # mit Fallback retry. Patti-Buchungen sind schon drin; Marker
+            # verhindert Duplikate beim nächsten Run.
+            logger.warning(
+                "commit batchUpdate failed for tenant=%s (%d ranges), falling back to per-row: %s",
+                cfg.tenant, len(pending_sheet_updates), e,
+            )
+            for range_a1, values in pending_sheet_updates:
+                try:
+                    _update_values(svc, cfg.spreadsheet_id, range_a1, values, tenant=cfg.tenant)
+                except Exception as sub_e:
+                    logger.error(
+                        "commit per-row retry failed tenant=%s range=%s: %s",
+                        cfg.tenant, range_a1, sub_e,
+                    )
+                    details.append({
+                        "phase": "flush_per_row",
+                        "range": range_a1,
+                        "error": str(sub_e),
+                        "tenant": cfg.tenant,
+                    })
+
+    # Fallback-Zeilen (BEIHILFE/UNSICHER) pro Zeile mit Dropdown-Fallback
+    for fb in pending_fallback_rows:
+        try:
+            _set_review_status_with_fallback(
+                svc,
+                cfg,
+                fb["review_row"],
+                fb["status"],
+                fallback_status=fb["status"],
+                fallback_prefix_in_purpose=fb["prefix"],
+            )
+            if fb["source_status"] is not None:
+                _sync_source_status_if_possible(
+                    cfg,
+                    svc,
+                    review_sheet_row=fb["review_row"],
+                    review_vdate=fb["vdate"],
+                    review_amount_cents=fb["amount_cents"],
+                    review_purpose=fb["purpose"],
+                    source_row_hint=fb["source_row_hint"],
+                    target_status=fb["source_status"],
+                    source_rows_cache=_get_source_rows_cache(),
+                )
+        except Exception as e:
+            logger.error(
+                "commit fallback row write failed tenant=%s review_row=%d: %s",
+                cfg.tenant, fb["review_row"], e,
+            )
+            details.append({
+                "phase": "fallback_write",
+                "review_row": fb["review_row"],
                 "error": str(e),
                 "tenant": cfg.tenant,
             })
